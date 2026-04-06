@@ -1,12 +1,20 @@
 import os
 import json
+import asyncio
 
 from lcb_runner.runner.parser import get_args
 from lcb_runner.utils.scenarios import Scenario
-from lcb_runner.lm_styles import LanguageModelStore
+from lcb_runner.lm_styles import LanguageModelStore, LanguageModel, LMStyle
 from lcb_runner.runner.runner_utils import build_runner
 from lcb_runner.utils.path_utils import get_output_path
 from lcb_runner.evaluation import extract_instance_results
+from lcb_runner.evaluation.pass_k_utils import (
+    compute_metrics_from_results,
+    extract_instance_results as extract_instance_results_from_dict,
+)
+from lcb_runner.evaluation.code_generation_evaluator import (
+    evaluate_single_problem_async,
+)
 from lcb_runner.runner.scenario_router import (
     build_prompt_benchmark,
     combine_results,
@@ -18,7 +26,20 @@ from lcb_runner.runner.scenario_router import (
 def main():
     args = get_args()
 
-    model = LanguageModelStore[args.model]
+    model = LanguageModelStore.get(args.model)
+    if model is None:
+        if args.api_base_url:
+            model = LanguageModel(
+                args.model,
+                args.model,
+                LMStyle.OpenAIChat,
+                None,
+            )
+        else:
+            raise ValueError(
+                f"Model {args.model} not found in LanguageModelStore. "
+                f"If you are using a custom API server, please provide --api_base_url."
+            )
     benchmark, format_prompt = build_prompt_benchmark(args)
     if args.debug:
         print(f"Running with {len(benchmark)} instances in debug mode")
@@ -223,5 +244,278 @@ def main():
             json.dump(save_eval_results, f, indent=4)
 
 
+# --- Async mode ---
+
+async def main_async():
+    args = get_args()
+
+    model = LanguageModelStore.get(args.model)
+    if model is None:
+        if args.api_base_url:
+            model = LanguageModel(
+                args.model,
+                args.model,
+                LMStyle.OpenAIChat,
+                None,
+            )
+        else:
+            raise ValueError(
+                f"Model {args.model} not found in LanguageModelStore. "
+                f"If you are using a custom API server, please provide --api_base_url."
+            )
+    benchmark, format_prompt = build_prompt_benchmark(args)
+    if args.debug:
+        print(f"Running with {len(benchmark)} instances in debug mode")
+        benchmark = benchmark[:15]
+
+    output_path = get_output_path(model.model_repr, args)
+    eval_file = output_path.replace(".json", "_eval.json")
+    eval_all_file = output_path.replace(".json", "_eval_all.json")
+
+    # Resume logic
+    if args.continue_existing or args.continue_existing_with_eval:
+        if os.path.exists(output_path):
+            with open(output_path, "r") as f:
+                old_save_results = json.load(f)
+        elif os.path.exists(eval_all_file):
+            with open(output_path, "r") as f:
+                old_save_results = json.load(f)
+        else:
+            print(
+                f"File {output_path} does not exist in --continue_existing, starting from scratch"
+            )
+            old_save_results = []
+
+        old_save_results = [
+            instance
+            for instance in old_save_results
+            if instance["output_list"] and [x for x in instance["output_list"] if x]
+        ]
+        old_save_results_question_ids = [
+            instance["question_id"] for instance in old_save_results
+        ]
+        remaining_benchmark = [
+            instance
+            for instance in benchmark
+            if instance.question_id not in old_save_results_question_ids
+        ]
+        print(
+            f"Found {len(old_save_results)} existing generations, continuing with {len(remaining_benchmark)} remaining"
+        )
+    else:
+        old_save_results = []
+        remaining_benchmark = benchmark
+
+    if len(remaining_benchmark) == 0:
+        print("No remaining problems to process.")
+        return
+
+    runner = build_runner(args, model)
+
+    llm_sem = asyncio.Semaphore(args.async_concurrency)
+    eval_sem = asyncio.Semaphore(args.eval_concurrency)
+
+    async def process_one(instance, idx):
+        async with llm_sem:
+            # 1. LLM generation with cache support
+            prompt = format_prompt(instance, model.model_style)
+            outputs = await runner._run_single_async(prompt)
+            assert len(outputs) == args.n, f"Expected {args.n} outputs, got {len(outputs)}"
+
+            # 2. Code extraction
+            if args.scenario == Scenario.codegeneration:
+                from lcb_runner.utils.extraction_utils import extract_code
+                extracted = [extract_code(o, model.model_style) for o in outputs]
+            elif args.scenario == Scenario.testoutputprediction:
+                from lcb_runner.utils.extraction_utils import extract_test_output_code
+                extracted = [extract_test_output_code(o, model.model_style) for o in outputs]
+            elif args.scenario == Scenario.codeexecution:
+                from lcb_runner.utils.extraction_utils import extract_execution_code
+                extracted = [
+                    extract_execution_code(o, model.model_style, cot=args.cot_code_execution)
+                    for o in outputs
+                ]
+            else:
+                extracted = outputs
+
+            # 3. Evaluation
+            grades = None
+            metadata = None
+            if args.evaluate and (
+                args.scenario == Scenario.codegeneration
+                or args.scenario == Scenario.selfrepair
+            ):
+                eval_sample = instance.get_evaluation_sample()
+                grades, metadata = await evaluate_single_problem_async(
+                    extracted, eval_sample, args.debug, args.timeout, eval_sem
+                )
+
+            return {
+                "idx": idx,
+                "instance": instance,
+                "outputs": outputs,
+                "extracted": extracted,
+                "grades": grades,
+                "metadata": metadata,
+            }
+
+    from tqdm.asyncio import tqdm_asyncio
+
+    tasks = [process_one(inst, i) for i, inst in enumerate(remaining_benchmark)]
+    results = await tqdm_asyncio.gather(*tasks, desc="Processing problems")
+
+    # Sort by original index
+    results.sort(key=lambda x: x["idx"])
+
+    # 4. Save outputs
+    save_results = [
+        instance.insert_output(r["outputs"], r["extracted"])
+        for instance, r in zip(remaining_benchmark, results)
+    ]
+
+    if args.continue_existing or args.continue_existing_with_eval:
+        save_results += old_save_results
+
+    save_results, combined_results = sort_and_extract_save_results(
+        args.scenario, save_results
+    )
+
+    with open(output_path, "w") as f:
+        json.dump(save_results, f, indent=4)
+
+    # 5. Evaluation results
+    if args.evaluate:
+        if args.continue_existing_with_eval and os.path.exists(eval_all_file):
+            with open(eval_all_file) as fp:
+                old_eval_all_results = json.load(fp)
+
+            if os.path.exists(eval_file):
+                with open(eval_file) as fp:
+                    old_eval_results = json.load(fp)
+            else:
+                old_eval_results = None
+
+            old_eval_results_question_ids = [
+                instance["question_id"] for instance in old_eval_all_results
+            ]
+            remaining_indices = [
+                idx
+                for idx in range(len(benchmark))
+                if benchmark[idx].question_id not in old_eval_results_question_ids
+            ]
+            benchmark = [benchmark[idx] for idx in remaining_indices]
+            results = [results[idx] for idx in remaining_indices]
+
+            old_eval_size = len(old_eval_results_question_ids)
+            new_eval_size = len(benchmark)
+
+            if new_eval_size == 0:
+                return
+
+            print(f"Found {old_eval_size}, running evals for {new_eval_size} problems")
+
+            # Build results dict from async results
+            results_dict = {}
+            for i, r in enumerate(results):
+                if r["grades"] is not None:
+                    results_dict[i] = r["grades"]
+
+            metrics = compute_metrics_from_results(results_dict, k_list=[1, 5])
+            graded = extract_instance_results_from_dict(results_dict)
+
+            if old_eval_results:
+                for key in metrics[0]:
+                    if key in old_eval_results[0]:
+                        if key != "detail":
+                            metrics[0][key] = (
+                                old_eval_size * old_eval_results[0][key]
+                                + new_eval_size * metrics[0][key]
+                            )
+                            metrics[0][key] /= old_eval_size + new_eval_size
+
+                for key in metrics[0]["detail"]:
+                    if key in old_eval_results[0]["detail"]:
+                        metrics[0]["detail"][key] = {
+                            **metrics[0]["detail"][key],
+                            **old_eval_results[0]["detail"][key],
+                        }
+                metrics[1] = {**metrics[1], **old_eval_results[1]}
+            else:
+                print("Old eval file not present, cannot update eval file")
+                metrics = {}
+
+        else:
+            # Build results dict from async results
+            results_dict = {}
+            for i, r in enumerate(results):
+                if r["grades"] is not None:
+                    results_dict[i] = r["grades"]
+
+            metrics = compute_metrics_from_results(results_dict, k_list=[1, 5])
+            graded = extract_instance_results_from_dict(results_dict)
+            old_eval_all_results = []
+            old_eval_results = []
+
+        if args.scenario == Scenario.codegeneration:
+            if metrics:
+                metadatas = [r["metadata"] for r in results]
+            else:
+                metadatas = [[] for _ in benchmark]
+            save_eval_results = [
+                instance.insert_output_evaluation(
+                    r["outputs"], r["extracted"], g, metadata=meta
+                )
+                for instance, r, g, meta in zip(
+                    benchmark, results, graded, metadatas
+                )
+            ]
+            if metrics and old_eval_results:
+                metrics[2] = old_eval_results[2] + metrics[2]
+        elif args.scenario == Scenario.selfrepair:
+            metadatas = [r["metadata"] for r in results]
+            with open(
+                f"output/{model.model_repr}/{Scenario.codegeneration}_{args.codegen_n}_{args.temperature}_eval_all.json"
+            ) as f:
+                code_gen_evals = json.load(f)
+            original_code_lists = [
+                code_gen_eval["code_list"] for code_gen_eval in code_gen_evals
+            ]
+
+            save_eval_results = [
+                instance.insert_output_evaluation(
+                    r["outputs"],
+                    r["extracted"],
+                    g,
+                    metadata=meta,
+                    original_code_list=original_code_list,
+                )
+                for instance, r, g, meta, original_code_list in zip(
+                    benchmark, results, graded, metadatas, original_code_lists
+                )
+            ]
+
+        else:
+            save_eval_results = [
+                instance.insert_output_evaluation(
+                    r["outputs"], r["extracted"], g
+                )
+                for instance, r, g in zip(
+                    benchmark, results, graded
+                )
+            ]
+
+        save_eval_results = old_eval_all_results + save_eval_results
+
+        with open(eval_file, "w") as f:
+            json.dump(metrics, f, indent=4)
+
+        with open(eval_all_file, "w") as f:
+            json.dump(save_eval_results, f, indent=4)
+
+
 if __name__ == "__main__":
-    main()
+    args = get_args()
+    if args.async_mode:
+        asyncio.run(main_async())
+    else:
+        main()

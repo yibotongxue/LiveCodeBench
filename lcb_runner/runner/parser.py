@@ -131,6 +131,35 @@ def get_args():
         default=None,
         help="End date for the contest to filter the evaluation file (format - YYYY-MM-DD)",
     )
+    parser.add_argument(
+        "--api_base_url",
+        type=str,
+        default=None,
+        help="Base URL for OpenAI-compatible API server (e.g. http://localhost:8000/v1). When set, the model will be queried via HTTP API instead of local vLLM.",
+    )
+    parser.add_argument(
+        "--api_key",
+        type=str,
+        default=None,
+        help="API key for OpenAI-compatible API server. Defaults to OPENAI_KEY env var or sk-dummy.",
+    )
+    parser.add_argument(
+        "--async_mode",
+        action="store_true",
+        help="Use async stream processing (generate + evaluate per-problem concurrently)",
+    )
+    parser.add_argument(
+        "--async_concurrency",
+        type=int,
+        default=16,
+        help="Max number of problems processed concurrently in async mode",
+    )
+    parser.add_argument(
+        "--eval_concurrency",
+        type=int,
+        default=8,
+        help="Max number of eval subprocesses running concurrently",
+    )
 
     args = parser.parse_args()
 

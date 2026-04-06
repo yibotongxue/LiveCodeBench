@@ -1,9 +1,10 @@
 import os
+import asyncio
 from time import sleep
 
 try:
     import openai
-    from openai import OpenAI
+    from openai import OpenAI, AsyncOpenAI
 except ImportError as e:
     pass
 
@@ -12,12 +13,12 @@ from lcb_runner.runner.base_runner import BaseRunner
 
 
 class OpenAIRunner(BaseRunner):
-    client = OpenAI(
-        api_key=os.getenv("OPENAI_KEY"),
-    )
-
     def __init__(self, args, model):
         super().__init__(args, model)
+        api_key = getattr(args, "api_key", None) or os.getenv("OPENAI_KEY", "sk-dummy")
+        base_url = getattr(args, "api_base_url", None)
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         if model.model_style == LMStyle.OpenAIReasonPreview:
             self.client_kwargs: dict[str | str] = {
                 "model": args.model,
@@ -53,7 +54,7 @@ class OpenAIRunner(BaseRunner):
             return []
 
         try:
-            response = OpenAIRunner.client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 messages=prompt,
                 **self.client_kwargs,
             )
@@ -72,6 +73,39 @@ class OpenAIRunner(BaseRunner):
             print("Consider reducing the number of parallel processes.")
             sleep(30)
             return self._run_single(prompt, n=n - 1)
+        except Exception as e:
+            print(f"Failed to run the model for {prompt}!")
+            print("Exception: ", repr(e))
+            raise e
+        return [c.message.content for c in response.choices]
+
+    async def _run_single_async(self, prompt: list[dict[str, str]], n: int = 10) -> list[str]:
+        """Async version using AsyncOpenAI client."""
+        assert isinstance(prompt, list)
+
+        if n == 0:
+            print("Max retries reached. Returning empty response.")
+            return []
+
+        try:
+            response = await self.async_client.chat.completions.create(
+                messages=prompt,
+                **self.client_kwargs,
+            )
+        except (
+            openai.APIError,
+            openai.RateLimitError,
+            openai.InternalServerError,
+            openai.OpenAIError,
+            openai.APIStatusError,
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+        ) as e:
+            print("Exception: ", repr(e))
+            print("Sleeping for 30 seconds...")
+            print("Consider reducing the number of parallel processes.")
+            await asyncio.sleep(30)
+            return await self._run_single_async(prompt, n=n - 1)
         except Exception as e:
             print(f"Failed to run the model for {prompt}!")
             print("Exception: ", repr(e))

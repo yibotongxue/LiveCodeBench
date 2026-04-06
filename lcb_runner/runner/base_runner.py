@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from abc import ABC, abstractmethod
 
 from tqdm import tqdm
@@ -178,4 +179,56 @@ class BaseRunner(ABC):
             format_prompt(problem, self.model.model_style) for problem in benchmark
         ]
         outputs = self.prompts_to_outputs(prompts)
+        return outputs
+
+    # --- Async methods ---
+
+    def _get_prompt_cache_key(self, prompt):
+        if isinstance(prompt, list):
+            return json.dumps(prompt)
+        elif isinstance(prompt, tuple):
+            return prompt[0] + json.dumps(prompt[1])
+        else:
+            return prompt
+
+    async def _run_single_async(self, prompt: str | list[dict[str, str]]) -> list[str]:
+        """Async single run with cache support."""
+        prompt_cache = self._get_prompt_cache_key(prompt)
+        if self.cache is not None and prompt_cache in self.cache:
+            if len(self.cache[prompt_cache]) == self.args.n:
+                return self.cache[prompt_cache]
+
+        result = await asyncio.to_thread(self._run_single, prompt)
+        assert len(result) == self.args.n
+
+        if self.cache is not None:
+            self.cache[prompt_cache] = result
+
+        return result
+
+    async def run_batch_async(
+        self, prompts: list[str | list[dict[str, str]]], semaphore: asyncio.Semaphore
+    ) -> list[list[str]]:
+        """Run all prompts concurrently under a semaphore."""
+        async def _with_semaphore(prompt):
+            async with semaphore:
+                return await self._run_single_async(prompt)
+        outputs = await asyncio.gather(*[_with_semaphore(p) for p in prompts])
+
+        if self.cache is not None:
+            self.save_cache()
+
+        return outputs
+
+    async def run_main_async(
+        self, benchmark: list, format_prompt: callable, semaphore: asyncio.Semaphore
+    ) -> list[list[str]]:
+        if self.args.scenario == Scenario.selfrepair:
+            # Self-repair is more complex; fall back to sync for now
+            return await asyncio.to_thread(self.run_main_repair, benchmark, format_prompt)
+
+        prompts = [
+            format_prompt(problem, self.model.model_style) for problem in benchmark
+        ]
+        outputs = await self.run_batch_async(prompts, semaphore)
         return outputs
