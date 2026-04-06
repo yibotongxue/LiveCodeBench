@@ -316,48 +316,49 @@ async def main_async():
     eval_sem = asyncio.Semaphore(args.eval_concurrency)
 
     async def process_one(instance, idx):
+        # 阶段 1：LLM 生成（受 llm_sem 限制）
         async with llm_sem:
-            # 1. LLM generation with cache support
             prompt = format_prompt(instance, model.model_style)
             outputs = await runner._run_single_async(prompt)
             assert len(outputs) == args.n, f"Expected {args.n} outputs, got {len(outputs)}"
 
-            # 2. Code extraction
-            if args.scenario == Scenario.codegeneration:
-                from lcb_runner.utils.extraction_utils import extract_code
-                extracted = [extract_code(o, model.model_style) for o in outputs]
-            elif args.scenario == Scenario.testoutputprediction:
-                from lcb_runner.utils.extraction_utils import extract_test_output_code
-                extracted = [extract_test_output_code(o, model.model_style) for o in outputs]
-            elif args.scenario == Scenario.codeexecution:
-                from lcb_runner.utils.extraction_utils import extract_execution_code
-                extracted = [
-                    extract_execution_code(o, model.model_style, cot=args.cot_code_execution)
-                    for o in outputs
-                ]
-            else:
-                extracted = outputs
+        # 代码提取（纯计算，不占用 semaphore）
+        if args.scenario == Scenario.codegeneration:
+            from lcb_runner.utils.extraction_utils import extract_code
+            extracted = [extract_code(o, model.model_style) for o in outputs]
+        elif args.scenario == Scenario.testoutputprediction:
+            from lcb_runner.utils.extraction_utils import extract_test_output_code
+            extracted = [extract_test_output_code(o, model.model_style) for o in outputs]
+        elif args.scenario == Scenario.codeexecution:
+            from lcb_runner.utils.extraction_utils import extract_execution_code
+            extracted = [
+                extract_execution_code(o, model.model_style, cot=args.cot_code_execution)
+                for o in outputs
+            ]
+        else:
+            extracted = outputs
 
-            # 3. Evaluation
-            grades = None
-            metadata = None
-            if args.evaluate and (
-                args.scenario == Scenario.codegeneration
-                or args.scenario == Scenario.selfrepair
-            ):
-                eval_sample = instance.get_evaluation_sample()
+        # 阶段 2：评测（受 eval_sem 限制，与 llm_sem 解耦）
+        grades = None
+        metadata = None
+        if args.evaluate and (
+            args.scenario == Scenario.codegeneration
+            or args.scenario == Scenario.selfrepair
+        ):
+            eval_sample = instance.get_evaluation_sample()
+            async with eval_sem:
                 grades, metadata = await evaluate_single_problem_async(
-                    extracted, eval_sample, args.debug, args.timeout, eval_sem
+                    extracted, eval_sample, args.debug, args.timeout
                 )
 
-            return {
-                "idx": idx,
-                "instance": instance,
-                "outputs": outputs,
-                "extracted": extracted,
-                "grades": grades,
-                "metadata": metadata,
-            }
+        return {
+            "idx": idx,
+            "instance": instance,
+            "outputs": outputs,
+            "extracted": extracted,
+            "grades": grades,
+            "metadata": metadata,
+        }
 
     from tqdm.asyncio import tqdm_asyncio
 
