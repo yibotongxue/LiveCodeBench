@@ -36,6 +36,8 @@ class PromptConstants:
 
     FORMATTING_WITHOUT_STARTER_CODE = "Read the inputs from stdin solve the problem and write the answer to stdout (do not directly test on the sample inputs). Enclose your code within delimiters as follows. Ensure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT."
 
+    STEP_BY_STEP_INSTRUCTION = "First, think step by step about the solution. Then, provide your final answer as a Python code block enclosed with triple backticks (```python ... ```)."
+
 
 def get_generic_question_template_answer(question: CodeGenerationProblem):
     prompt = f"### Question:\n{question.question_content}\n\n"
@@ -48,6 +50,7 @@ def get_generic_question_template_answer(question: CodeGenerationProblem):
         prompt += f"### Format: {PromptConstants.FORMATTING_WITHOUT_STARTER_CODE}\n"
         prompt += "```python\n# YOUR CODE HERE\n```\n\n"
     prompt += f"### Answer: (use the provided format with backticks)\n\n"
+    prompt += f"{PromptConstants.STEP_BY_STEP_INSTRUCTION}\n\n"
     return prompt
 
 
@@ -62,6 +65,7 @@ def get_oaireason_question_template_answer(question: CodeGenerationProblem):
         prompt += f"### Format: Implement a function called `main()` which orchastrates the solution by reading inputs from stdin and writing the answer to stdout. Feel free to use additional functions as necessary. Next do NOT forget to call `main` function at the end of the program otherwise you will not be awarded any points.\n"
         prompt += "```python\n# YOUR CODE HERE\n```\n\n"
     prompt += f"### Answer: (use the provided format with backticks)\n\n"
+    prompt += f"{PromptConstants.STEP_BY_STEP_INSTRUCTION}\n\n"
     return prompt
 
 
@@ -76,6 +80,7 @@ def get_geminithinking_question_template_answer(question: CodeGenerationProblem)
         prompt += f"### Format: {PromptConstants.FORMATTING_WITHOUT_STARTER_CODE}\n"
         prompt += "```python\n# YOUR CODE HERE\n```\n\n"
     prompt += f"### Answer: (use the provided format with backticks)\n\n"
+    prompt += f"{PromptConstants.STEP_BY_STEP_INSTRUCTION}\n\n"
     return prompt
 
 
